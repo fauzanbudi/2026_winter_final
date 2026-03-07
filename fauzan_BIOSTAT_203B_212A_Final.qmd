@@ -1,0 +1,425 @@
+---
+title: "BIOSTAT_203B_212A_Final"
+format: html
+---
+
+Setting up the environment and connecting to the database. I will use DuckDB to filter my cohort
+```{r}
+#| message: false
+#| warning: false
+#| 
+install.packages("comorbidity")
+library(DBI)
+library(duckdb)
+library(dplyr)
+library(comorbidity)
+
+mimic_dir <- "~/mimic"
+
+con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+```
+
+Loading the relevant tables into DuckDB
+```{r}
+services_path   <- file.path(mimic_dir, "hosp", "services.csv.gz")
+admissions_path <- file.path(mimic_dir, "hosp", "admissions.csv.gz")
+patients_path   <- file.path(mimic_dir, "hosp", "patients.csv.gz")
+diagnoses_path  <- file.path(mimic_dir, "hosp", "diagnoses_icd.csv.gz")
+ecg_path        <- file.path(mimic_dir, "ecg", "machine_measurements.csv")
+
+
+dbExecute(con, glue::glue("
+  CREATE OR REPLACE VIEW services AS
+  SELECT * FROM read_csv_auto('{services_path}', header=true);
+
+  CREATE OR REPLACE VIEW admissions AS
+  SELECT * FROM read_csv_auto('{admissions_path}', header=true);
+
+  CREATE OR REPLACE VIEW patients AS
+  SELECT * FROM read_csv_auto('{patients_path}', header=true);
+
+  CREATE OR REPLACE VIEW diagnoses AS
+  SELECT * FROM read_csv_auto('{diagnoses_path}', header=true);
+  
+  CREATE OR REPLACE VIEW ecg_mm AS
+  SELECT * FROM read_csv_auto('{ecg_path}', header=true);
+"))
+```
+
+Filtering services to only include CSURG as current or previous service
+```{r}
+dbExecute(con, "DROP TABLE IF EXISTS csurg_adm;")
+
+dbExecute(con, "
+  CREATE TEMP TABLE csurg_adm AS
+  SELECT
+    a.subject_id,
+    a.hadm_id,
+    a.admittime,
+    a.dischtime,
+    a.hospital_expire_flag,
+    a.discharge_location,
+    a.insurance,
+    a.language,
+    a.marital_status,
+    a.race
+  FROM admissions a
+  WHERE a.admittime IS NOT NULL
+    AND a.dischtime IS NOT NULL
+    AND EXISTS (
+      SELECT 1
+      FROM services s
+      WHERE s.hadm_id = a.hadm_id
+        AND (s.curr_service = 'CSURG' OR s.prev_service = 'CSURG')
+    );
+")
+```
+- There are 13,350 patients in the CSURG cohort before filtering further
+
+Filtering the CSURG admissions to only those that have an ECG measurement during the hospital stay
+```{r}
+dbExecute(con, "DROP TABLE IF EXISTS csurg_ecg;")
+
+dbExecute(con, "
+  CREATE TEMP TABLE csurg_ecg AS
+  SELECT
+    c.*
+  FROM csurg_adm c
+  WHERE EXISTS (
+    SELECT 1
+    FROM ecg_mm e
+    WHERE e.subject_id = c.subject_id
+      AND e.ecg_time BETWEEN c.admittime AND c.dischtime
+  );
+")
+```
+- There are now 8,491 patients
+
+Creating columns for: next admit time (if applicable), time to next admission, and 30-day readmission binary label
+```{r}
+dbExecute(con, "DROP TABLE IF EXISTS readmit_labels;")
+
+dbExecute(con, "
+  CREATE TEMP TABLE readmit_labels AS
+  WITH next_adm AS (
+    SELECT
+      i.subject_id,
+      i.hadm_id AS index_hadm_id,
+      i.dischtime AS index_dischtime,
+      MIN(a.admittime) AS next_admittime
+    FROM csurg_ecg i
+    LEFT JOIN admissions a
+      ON a.subject_id = i.subject_id
+     AND a.admittime > i.dischtime
+    GROUP BY i.subject_id, i.hadm_id, i.dischtime
+  )
+  SELECT
+    i.*,
+    n.next_admittime,
+    DATE_DIFF('hour', i.dischtime, n.next_admittime) AS hours_to_next,
+    CASE
+      WHEN n.next_admittime IS NULL THEN 0
+      WHEN DATE_DIFF('hour', i.dischtime, n.next_admittime) <= 24 THEN NULL
+      WHEN DATE_DIFF('day',  i.dischtime, n.next_admittime) <= 30 THEN 1
+      ELSE 0
+    END AS readmit_30d
+  FROM csurg_ecg i
+  LEFT JOIN next_adm n
+    ON n.index_hadm_id = i.hadm_id;
+")
+```
+
+Gathering sums for each readmission category to understand the distribution of our outcome variable
+```{r}
+dbGetQuery(con, "
+  SELECT
+    SUM(CASE WHEN next_admittime IS NULL THEN 1 ELSE 0 END) AS no_next_adm,
+    SUM(CASE WHEN hours_to_next <= 24 THEN 1 ELSE 0 END) AS le_24h,
+    SUM(CASE WHEN hours_to_next > 24 AND hours_to_next <= 24*30 THEN 1 ELSE 0 END) AS readmit_30d_window,
+    SUM(CASE WHEN hours_to_next > 24*30 THEN 1 ELSE 0 END) AS after_30d
+  FROM readmit_labels;
+")
+```
+- No readmission: 4,577
+- Readmission within 24h “bounce-back” (will be excluded): 67
+- Readmission between 24h and 30d: 1,280
+- Readmission greater than 30d: 2,567
+
+Excluding readmission within 24 hrs
+```{r}
+dbExecute(con, "DROP TABLE IF EXISTS final_cohort;")
+
+dbExecute(con, "
+  CREATE TEMP TABLE final_cohort AS
+  SELECT *
+  FROM readmit_labels
+  WHERE hours_to_next IS NULL OR hours_to_next > 24;
+");
+```
+- This brings our cohort down to 8424 patients
+
+Selecting last ECG measurement during the hospital stay for each admission
+```{r}
+dbExecute(con, "DROP TABLE IF EXISTS last_ecg;")
+
+dbExecute(con, "
+  CREATE TEMP TABLE last_ecg AS
+  SELECT *
+  FROM (
+    SELECT
+      c.hadm_id,
+      c.subject_id,
+      c.admittime,
+      c.dischtime,
+      e.study_id,
+      e.ecg_time,
+      e.rr_interval,
+      e.p_onset,
+      e.p_end,
+      e.qrs_onset,
+      e.qrs_end,
+      e.t_end,
+      e.p_axis,
+      e.qrs_axis,
+      e.t_axis,
+
+      ROW_NUMBER() OVER (
+        PARTITION BY c.hadm_id
+        ORDER BY e.ecg_time DESC
+      ) AS rn
+    FROM final_cohort c
+    JOIN ecg_mm e
+      ON e.subject_id = c.subject_id
+     AND e.ecg_time BETWEEN c.admittime AND c.dischtime
+  ) t
+  WHERE rn = 1;
+")
+```
+
+Adding diagnoses to the final cohort
+```{r}
+dbExecute(con, "DROP TABLE IF EXISTS dx_cohort;")
+
+dbExecute(con, "
+  CREATE TEMP TABLE dx_cohort AS
+  SELECT
+    d.subject_id,
+    d.hadm_id,
+    d.icd_code,
+    d.icd_version
+  FROM diagnoses d
+  JOIN final_cohort c
+    ON c.hadm_id = d.hadm_id
+  WHERE d.icd_code IS NOT NULL;
+")
+```
+
+Creating tibble for diagnoses and seeing how many ICD9 vs ICD10 codes in the cohort
+```{r}
+dx <- tbl(con, "dx_cohort") |> collect()
+
+dx |> count(icd_version)
+```
+- There are 76,972 ICD9 codes
+- There are 45,758 ICD10 codes
+
+Generating elixhauser comorbidity index by ICD9 and ICD10 codes separately
+```{r}
+dx9  <- dx |> filter(icd_version == 9)
+dx10 <- dx |> filter(icd_version == 10)
+
+elix9 <- if (nrow(dx9) > 0) {
+  comorbidity(
+    x = dx9,
+    id = "hadm_id",
+    code = "icd_code",
+    map = "elixhauser_icd9_quan",
+    assign0 = TRUE,
+    tidy.codes = TRUE
+  )
+} else {
+  NULL
+}
+
+elix10 <- if (nrow(dx10) > 0) {
+  comorbidity(
+    x = dx10,
+    id = "hadm_id",
+    code = "icd_code",
+    map = "elixhauser_icd10_quan",
+    assign0 = TRUE,
+    tidy.codes = TRUE
+  )
+} else {
+  NULL
+}
+
+```
+
+Combine and collapse to one row per hadm_id
+```{r}
+elix_all <- bind_rows(elix9, elix10) |>
+  group_by(hadm_id) |>
+  summarise(across(where(is.numeric), ~max(.x, na.rm = TRUE)), .groups = "drop")
+
+nrow(elix_all)
+n_distinct(elix_all$hadm_id)
+```
+
+Joining all the data together to create the final dataset for modeling. This will include the last ECG measurement for each admission, along with the readmission label and any other relevant features from the admissions, patients, and diagnoses tables. We will create a temporary table `final_dataset` that contains all the necessary information for modeling.
+```{r}
+dbExecute(con, "DROP TABLE IF EXISTS final_tbl;")
+
+dbExecute(con, "
+  CREATE TEMP TABLE final_tbl AS
+  SELECT
+    c.*,
+    l.study_id,
+    l.ecg_time,
+    l.rr_interval,
+    l.p_onset,
+    l.p_end,
+    l.qrs_onset,
+    l.qrs_end,
+    l.t_end,
+    l.p_axis,
+    l.qrs_axis,
+    l.t_axis
+  FROM final_cohort c
+  LEFT JOIN last_ecg l
+    ON l.hadm_id = c.hadm_id;
+")
+```
+
+Pulling cohort into a tibble to use for modeling
+```{r}
+cohort <- tbl(con, "final_tbl") |> collect()
+
+cohort_final <- cohort |> left_join(elix_all, by = "hadm_id")
+
+nrow(cohort_final)
+dplyr::n_distinct(cohort_final$hadm_id)
+```
+
+```{r}
+cohort_final <- cohort_final |> 
+  mutate(readmit_30d = as.factor(cohort_final$readmit_30d))
+
+str(cohort_final)
+```
+
+```{r}
+library(recipes)
+library(tidymodels)
+library(themis)    
+set.seed(123)
+
+rec <- recipe(readmit_30d ~ ., data = cohort_final) %>%
+  
+  # remove IDs / leakage variables
+  step_rm(subject_id, hadm_id, study_id, next_admittime) %>%
+  
+  # convert datetime → useful numeric features
+  step_mutate(
+    los_hours = as.numeric(dischtime - admittime, units = "hours"),
+    ecg_to_admit = as.numeric(ecg_time - admittime, units = "hours")
+  ) %>%
+  
+  # remove raw datetime columns
+  step_rm(admittime, dischtime, ecg_time) %>%
+
+  # remov unnecessary variables that won't be used in modeling
+  step_rm(hours_to_next) %>%
+
+  # handle categorical variables
+  step_string2factor(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  
+  # impute missing values
+  step_impute_median(all_numeric_predictors()) %>%
+  
+  # remove constant predictors
+  step_zv(all_predictors()) %>%
+  
+  # normalize numeric predictors (optional but often helpful)
+  step_normalize(all_numeric_predictors()) %>%
+
+  # handle imbalance
+  step_smote(readmit_30d)
+```
+
+```{r}
+split <- initial_split(cohort_final, prop = 0.8, strata = readmit_30d)
+
+train_data <- training(split)
+test_data  <- testing(split)
+```
+
+```{r}
+xgb_model <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+```
+
+```{r}
+wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(xgb_model)
+```
+```{r}
+folds <- vfold_cv(train_data, v = 5, strata = readmit_30d)
+```
+```{r}
+grid <- grid_latin_hypercube(
+  trees(),
+  tree_depth(),
+  min_n(),
+  learn_rate(),
+  loss_reduction(),
+  sample_prop(),
+  size = 20
+)
+```
+```{r}
+tune_res <- tune_grid(
+  wf,
+  resamples = folds,
+  grid = grid,
+  metrics = metric_set(roc_auc)
+)
+```
+
+```{r}
+best_params <- select_best(tune_res, metric = "roc_auc")
+```
+
+
+```{r}
+final_wf <- finalize_workflow(wf, best_params)
+
+final_fit <- final_wf %>%
+  last_fit(split)
+```
+
+
+```{r}
+collect_metrics(final_fit)
+```
+
+
+```{r}
+library(vip)
+
+final_model <- extract_fit_parsnip(final_fit$.workflow[[1]])
+
+vip(final_model)
+```
