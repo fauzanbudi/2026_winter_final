@@ -346,18 +346,18 @@ rec <- recipe(readmit_30d ~ ., data = cohort_final) %>%
   # remove IDs / leakage variables
   step_rm(subject_id, hadm_id, study_id, next_admittime) %>%
   
-  # convert datetime → useful numeric features
-  step_mutate(
-    los_hours = as.numeric(dischtime - admittime, units = "hours")
-    # ,
-    # ecg_to_admit = as.numeric(ecg_time - admittime, units = "hours")
-  ) %>%
+  # # convert datetime → useful numeric features
+  # step_mutate(
+  #   los_hours = as.numeric(dischtime - admittime, units = "hours")
+  #   # ,
+  #   # ecg_to_admit = as.numeric(ecg_time - admittime, units = "hours")
+  # ) %>%
   
   # remove raw datetime columns
   step_rm(admittime, dischtime, ecg_time, edregtime, edouttime) %>%
 
   # remov unnecessary variables that won't be used in modeling
-  step_rm(hours_to_next) %>%
+  step_rm(hours_to_next, anchor_year) %>%
 
   # handle categorical variables
   step_string2factor(all_nominal_predictors()) %>%
@@ -388,12 +388,12 @@ test_data  <- testing(split)
 
 ```{r}
 xgb_model <- boost_tree(
-  trees = tune(),
-  tree_depth = tune(),
-  min_n = tune(),
   learn_rate = tune(),
-  loss_reduction = tune(),
-  sample_size = tune()
+  tree_depth = tune(),
+  trees = tune()
+  # sample_size = tune(),
+  # min_n = tune(),
+  # loss_reduction = tune()
 ) %>%
   set_engine("xgboost") %>%
   set_mode("classification")
@@ -405,18 +405,25 @@ wf <- workflow() %>%
   add_model(xgb_model)
 ```
 ```{r}
-folds <- vfold_cv(train_data, v = 5, strata = readmit_30d)
+folds <- vfold_cv(train_data, v = 10, strata = readmit_30d)
 ```
 ```{r}
-grid <- grid_latin_hypercube(
-  trees(),
-  tree_depth(),
-  min_n(),
-  learn_rate(),
-  loss_reduction(),
-  sample_prop(),
-  size = 20
+# grid <- grid_latin_hypercube(
+#   learn_rate(),
+#   tree_depth(),
+#   trees(),
+#   sample_prop(),
+#   min_n(),
+#   loss_reduction(),
+#   size = 20
+# )
+
+grid <- grid_regular(
+  learn_rate(range = c(-2, -1)),
+  tree_depth(range = c(3L, 15L)),
+  trees(range = c(50L, 2000L))
 )
+
 ```
 ```{r}
 tune_res <- tune_grid(
@@ -425,10 +432,20 @@ tune_res <- tune_grid(
   grid = grid,
   metrics = metric_set(roc_auc)
 )
+
+# tune_res
 ```
 
 ```{r}
 best_params <- select_best(tune_res, metric = "roc_auc")
+
+all_results <- tune_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(learn_rate, tree_depth, trees, mean, .metric, .estimator, n, std_err, .config) %>%
+  arrange(desc(mean))
+
+print(all_results, n = nrow(all_results))
 ```
 
 
