@@ -8,7 +8,7 @@ Setting up the environment and connecting to the database. I will use DuckDB to 
 #| message: false
 #| warning: false
 #| 
-install.packages("comorbidity")
+# install.packages("comorbidity")
 library(DBI)
 library(duckdb)
 library(dplyr)
@@ -26,6 +26,7 @@ admissions_path <- file.path(mimic_dir, "hosp", "admissions.csv.gz")
 patients_path   <- file.path(mimic_dir, "hosp", "patients.csv.gz")
 diagnoses_path  <- file.path(mimic_dir, "hosp", "diagnoses_icd.csv.gz")
 ecg_path        <- file.path(mimic_dir, "ecg", "machine_measurements.csv")
+icustays_path   <- file.path(mimic_dir, "icu", "icustays.csv.gz")
 
 
 dbExecute(con, glue::glue("
@@ -43,6 +44,9 @@ dbExecute(con, glue::glue("
   
   CREATE OR REPLACE VIEW ecg_mm AS
   SELECT * FROM read_csv_auto('{ecg_path}', header=true);
+
+  CREATE OR REPLACE VIEW icustays AS
+  SELECT * FROM read_csv_auto('{icustays_path}', header=true);
 "))
 ```
 
@@ -62,7 +66,10 @@ dbExecute(con, "
     a.insurance,
     a.language,
     a.marital_status,
-    a.race
+    a.race,
+    a.edregtime,
+    a.edouttime,
+    a.hospital_expire_flag
   FROM admissions a
   WHERE a.admittime IS NOT NULL
     AND a.dischtime IS NOT NULL
@@ -295,17 +302,37 @@ Pulling cohort into a tibble to use for modeling
 ```{r}
 cohort <- tbl(con, "final_tbl") |> collect()
 
-cohort_final <- cohort |> left_join(elix_all, by = "hadm_id")
+# cohort_final <- cohort |> left_join(elix_all, by = "hadm_id")
+```
 
-nrow(cohort_final)
-dplyr::n_distinct(cohort_final$hadm_id)
+```{r}
+# cohort <- tbl(con, "final_tbl") |> collect()
+
+cohort_final <- cohort |> 
+  left_join(elix_all, by = "hadm_id") |>
+  left_join(tbl(con, "patients") |> collect() |> select(subject_id, gender,
+    anchor_age, anchor_year, anchor_year_group), by = "subject_id") |>
+  left_join(tbl(con, "icustays") |> collect() |> select(subject_id, hadm_id,
+    first_careunit, last_careunit, los), by = c("subject_id", "hadm_id")) |>
+  rename(icu_first_careunit = first_careunit,
+    icu_last_careunit = last_careunit,
+    icu_los = los) |>
+  mutate(ed_los = as.numeric(difftime(edouttime, edregtime, units = "hours")),
+    hosp_los = as.numeric(difftime(dischtime, admittime, units = "hours")),
+    icu_yn = if_else(!is.na(icu_first_careunit), 1, 0))
+
+str(cohort_final)
 ```
 
 ```{r}
 cohort_final <- cohort_final |> 
   mutate(readmit_30d = as.factor(cohort_final$readmit_30d))
-
 str(cohort_final)
+```
+
+```{r}
+nrow(cohort_final)
+dplyr::n_distinct(cohort_final$hadm_id)
 ```
 
 ```{r}
@@ -321,12 +348,13 @@ rec <- recipe(readmit_30d ~ ., data = cohort_final) %>%
   
   # convert datetime → useful numeric features
   step_mutate(
-    los_hours = as.numeric(dischtime - admittime, units = "hours"),
-    ecg_to_admit = as.numeric(ecg_time - admittime, units = "hours")
+    los_hours = as.numeric(dischtime - admittime, units = "hours")
+    # ,
+    # ecg_to_admit = as.numeric(ecg_time - admittime, units = "hours")
   ) %>%
   
   # remove raw datetime columns
-  step_rm(admittime, dischtime, ecg_time) %>%
+  step_rm(admittime, dischtime, ecg_time, edregtime, edouttime) %>%
 
   # remov unnecessary variables that won't be used in modeling
   step_rm(hours_to_next) %>%
@@ -344,10 +372,11 @@ rec <- recipe(readmit_30d ~ ., data = cohort_final) %>%
   step_zv(all_predictors()) %>%
   
   # normalize numeric predictors (optional but often helpful)
-  step_normalize(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) 
+  # %>%
 
-  # handle imbalance
-  step_smote(readmit_30d)
+  # # # handle imbalance
+  # step_smote(readmit_30d)
 ```
 
 ```{r}
