@@ -73,6 +73,7 @@ dbExecute(con, "
   FROM admissions a
   WHERE a.admittime IS NOT NULL
     AND a.dischtime IS NOT NULL
+    AND a.hospital_expire_flag = 0
     AND EXISTS (
       SELECT 1
       FROM services s
@@ -302,7 +303,26 @@ Pulling cohort into a tibble to use for modeling
 ```{r}
 cohort <- tbl(con, "final_tbl") |> collect()
 
+nrow(cohort)
+n_distinct(cohort$hadm_id)
+n_distinct(cohort$subject_id)
+head(cohort)
+
 # cohort_final <- cohort |> left_join(elix_all, by = "hadm_id")
+```
+
+```{r}
+icu_summary <- tbl(con, "icustays") %>%
+  collect() %>%
+  group_by(subject_id, hadm_id) %>%
+  summarise(
+    icu_los_total = sum(los, na.rm = TRUE),
+    n_icu_stays = n(),
+    # icu_los_mean = mean(los, na.rm = TRUE),
+    # icu_first_careunit = first(first_careunit),
+    # icu_last_careunit  = last(last_careunit),
+    .groups = "drop"
+  )
 ```
 
 ```{r}
@@ -312,16 +332,57 @@ cohort_final <- cohort |>
   left_join(elix_all, by = "hadm_id") |>
   left_join(tbl(con, "patients") |> collect() |> select(subject_id, gender,
     anchor_age, anchor_year, anchor_year_group), by = "subject_id") |>
-  left_join(tbl(con, "icustays") |> collect() |> select(subject_id, hadm_id,
-    first_careunit, last_careunit, los), by = c("subject_id", "hadm_id")) |>
-  rename(icu_first_careunit = first_careunit,
-    icu_last_careunit = last_careunit,
-    icu_los = los) |>
+  # left_join(tbl(con, "icustays") |> collect() |> select(subject_id, hadm_id,
+  #   first_careunit, last_careunit, los), by = c("subject_id", "hadm_id")) |>
+  left_join(icu_summary, by = c("subject_id", "hadm_id")) |>
+  # rename(icu_first_careunit = first_careunit,
+  #   icu_last_careunit = last_careunit,
+  #   icu_los = los) |>
   mutate(ed_los = as.numeric(difftime(edouttime, edregtime, units = "hours")),
-    hosp_los = as.numeric(difftime(dischtime, admittime, units = "hours")),
-    icu_yn = if_else(!is.na(icu_first_careunit), 1, 0))
+    hosp_los = as.numeric(difftime(dischtime, admittime, units = "hours"))
+    # , icu_yn = if_else(!is.na(icu_first_careunit), 1, 0)
+    ) |>
+  distinct(subject_id, hadm_id, .keep_all = TRUE) 
+  # |>
+  # select(-hospital_expire_flag, -hospital_expire_flag_1)
+  
+```
 
+```{r}
+# cohort_final$hospital_expire_flag
+# cohort_final$hospital_expire_flag_1
+summary(cohort_final)
+```
+
+```{r}
 str(cohort_final)
+nrow(cohort_final)
+n_distinct(cohort_final$hadm_id)
+n_distinct(cohort_final$subject_id)
+head(cohort_final)
+```
+```{r}
+library(tableone)
+desc_table <- CreateTableOne(data = cohort_final |> select(-subject_id, -hadm_id, -study_id, -next_admittime),
+  strata = "readmit_30d",
+  test = TRUE,
+  smd = TRUE
+)
+desc_table1 <- print(desc_table, showAllLevels = TRUE, quote = TRUE, nospaces = TRUE)
+
+write.csv(desc_table1, file = "descriptive_table.csv", row.names = TRUE)
+
+```
+
+```{r}
+library(gtsummary)
+desc_table2 <- cohort_final |> 
+  select(-subject_id, -hadm_id, -study_id, -next_admittime) |> 
+  tbl_summary(by = readmit_30d, missing = "no") |> 
+  add_p() |> 
+  add_overall() |> 
+  add_n() |> 
+  bold_labels()
 ```
 
 ```{r}
@@ -333,6 +394,7 @@ str(cohort_final)
 ```{r}
 nrow(cohort_final)
 dplyr::n_distinct(cohort_final$hadm_id)
+dplyr::n_distinct(cohort_final$subject_id)
 ```
 
 ```{r}
@@ -420,8 +482,8 @@ folds <- vfold_cv(train_data, v = 10, strata = readmit_30d)
 
 grid <- grid_regular(
   learn_rate(range = c(-2, -1)),
-  tree_depth(range = c(3L, 15L)),
-  trees(range = c(50L, 2000L))
+  tree_depth(range = c(3L, 10L)),
+  trees(range = c(50L, 1000L))
 )
 
 ```
@@ -450,10 +512,20 @@ print(all_results, n = nrow(all_results))
 
 
 ```{r}
+my_metrics <- metric_set(
+  roc_auc,
+  pr_auc,
+  sens,
+  spec,
+  accuracy,
+  ppv,
+  npv
+)
+
 final_wf <- finalize_workflow(wf, best_params)
 
 final_fit <- final_wf %>%
-  last_fit(split)
+  last_fit(split, metrics = my_metrics)
 ```
 
 
