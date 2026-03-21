@@ -1,238 +1,353 @@
 ---
-title: "BIOSTAT_203B_212A_Final"
-format: html
+title: "Predicting 30-Day Readmission After Cardiac Surgery Using MIMIC-IV Dataset"
+subtitle: "Biostat 203B and 212A Final Project"
+author: "Fauzan Budi Prasetya and UID 306779006"
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    number-sections: false
+    toc: true
+    toc-depth: 4
+    toc-location: left
+    code-fold: false
+    self-contained: true
 ---
 
-Setting up the environment and connecting to the database. I will use DuckDB to filter my cohort
 ```{r}
-#| message: false
-#| warning: false
-#| 
-# install.packages("comorbidity")
+# install.packages(c("bigrquery","DBI","tidyverse","glue"))
+library(bigrquery)
 library(DBI)
-library(duckdb)
-library(dplyr)
+library(tidyverse)
+library(glue)
+
+# bigrquery::bq_auth(use_oob = TRUE)
+
+con_bq <- DBI::dbConnect(
+  bigrquery::bigquery(),
+  project = "physionet-data-486705",
+  dataset = "fauzan_staging",
+  billing = "physionet-data-486705"
+)
+
+DBI::dbListTables(con_bq)
+```
+
+```{r}
+## NEW VERSION
+# my_staging <- "physionet-data-486705.fauzan_staging"
+physio_hosp <- "physionet-data.mimiciv_3_1_hosp"
+physio_ecg  <- "physionet-data.mimiciv_ecg"
+physio_icu  <- "physionet-data.mimiciv_3_1_icu"
+
+query <- "
+    -- CREATE OR REPLACE TABLE `{my_staging}.cohort_table` AS
+    
+    -- STEP 1: Get patients's admissions with cardiac surgery (CSURG)
+    WITH csurg_adm AS (
+      SELECT
+        a.subject_id, 
+        a.hadm_id, 
+        a.admittime, 
+        a.dischtime,
+        a.discharge_location, 
+        a.admission_type,
+        a.admission_location,
+        a.insurance,
+        a.language, 
+        a.marital_status, 
+        a.race,
+        a.hospital_expire_flag,
+        DATE_DIFF(dischtime, admittime, DAY) as hosp_los
+
+      FROM `{physio_hosp}.admissions` a
+      WHERE a.admittime IS NOT NULL
+        AND a.dischtime IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM `{physio_hosp}.services` s
+          WHERE s.hadm_id = a.hadm_id
+            AND (s.curr_service = 'CSURG' OR s.prev_service = 'CSURG')
+        )
+    )
+
+    -- STEP 2: Filter patient's admissions with ECG's check-up and take only first CSURG admission
+    # , csurg_adm_with_ecg1 AS (
+    , csurg_adm_with_ecg as (
+      SELECT c.*
+      FROM csurg_adm c
+      WHERE EXISTS (
+        SELECT 1
+        FROM `{physio_ecg}.machine_measurements` e
+        WHERE e.subject_id = c.subject_id
+          AND e.ecg_time BETWEEN c.admittime AND c.dischtime
+      )
+    )
+
+    , readmit_labels AS (
+
+      -- STEP 3.1: Get all patient's admissions after previous CSURG and ECG
+      WITH following_csurg_adm as (
+        SELECT 
+              a.subject_id, 
+              a.admittime, 
+              c.dischtime as prev_dischtime
+          FROM `{physio_hosp}.admissions` a
+          JOIN csurg_adm_with_ecg c 
+            ON a.subject_id = c.subject_id 
+            AND a.admittime > c.dischtime
+        )
+
+      -- STEP 3.2: Get the first following admission
+      , first_following_csurg_adm as (
+        SELECT
+          subject_id,
+          prev_dischtime,
+          MIN(admittime) AS next_admittime
+        FROM following_csurg_adm
+        GROUP BY subject_id, prev_dischtime
+      )
+      
+        -- STEP 3.2:  Label patient's readmission
+        SELECT
+          i.*,
+          n.next_admittime,
+          DATETIME_DIFF(n.next_admittime, i.dischtime, HOUR) AS hours_to_next,
+          CASE
+            WHEN n.next_admittime IS NULL THEN 0
+            WHEN DATETIME_DIFF(n.next_admittime, i.dischtime, DAY) <= 30 
+              AND DATETIME_DIFF(n.next_admittime, i.dischtime, HOUR) > 24 THEN 1
+            ELSE 0
+          END AS readmit_30d,
+          CASE 
+            WHEN n.next_admittime IS NOT NULL 
+              AND DATETIME_DIFF(n.next_admittime, i.dischtime, HOUR) <= 24 THEN 'planned_or_transfer'
+            ELSE 'standard'
+          END as readmission_category
+        FROM csurg_adm_with_ecg i
+        LEFT JOIN first_following_csurg_adm n 
+          ON n.subject_id = i.subject_id 
+          AND n.prev_dischtime = i.dischtime
+    )
+
+    -- STEP 4: Exclude early readmissions, death and hospice and paliative care
+    , final_cohort AS (
+      SELECT * except(readmission_category)
+      FROM readmit_labels
+      WHERE 
+        hospital_expire_flag = 0
+        and discharge_location NOT IN ('HOSPICE', 'PALLIATIVE CARE')
+        and readmission_category NOT IN ('planned_or_transfer')
+    )
+
+    -- STEP 5: Get patient's last ECG
+    , last_ecg AS (
+      # SELECT * EXCEPT(rn)
+      SELECT * # edited because of this csurg_adm_with_ecg1
+      FROM (
+        SELECT
+          c.hadm_id, 
+          e.study_id, 
+          e.ecg_time, 
+          e.rr_interval, 
+          # e.p_onset, 
+          # e.p_end,
+          e.qrs_onset, 
+          e.qrs_end, 
+          e.t_end, 
+          # e.p_axis, 
+          e.qrs_axis, 
+          e.t_axis,
+          SAFE_DIVIDE(60000, e.rr_interval) AS ecg_heart_rate,
+          # e.p_end - e.p_onset AS p_dur,
+          e.qrs_end - e.qrs_onset AS qrs_dur,
+          e.t_end - e.qrs_onset AS qt_proxy,
+          e.t_end - e.qrs_end AS t_dur,
+          ROW_NUMBER() OVER (PARTITION BY c.hadm_id ORDER BY e.ecg_time DESC) AS rn
+        FROM final_cohort c
+        JOIN 
+        (
+          select 
+              subject_id, 
+              study_id, 
+              ecg_time, 
+              CASE WHEN rr_interval >= 10000 THEN NULL ELSE rr_interval END AS rr_interval,
+              # CASE WHEN p_onset     >= 10000 THEN NULL ELSE p_onset     END AS p_onset,
+              # CASE WHEN p_end       >= 10000 THEN NULL ELSE p_end       END AS p_end,
+              CASE WHEN qrs_onset   >= 10000 THEN NULL ELSE qrs_onset   END AS qrs_onset,
+              CASE WHEN qrs_end     >= 10000 THEN NULL ELSE qrs_end     END AS qrs_end,
+              CASE WHEN t_end       >= 10000 THEN NULL ELSE t_end       END AS t_end,
+              # CASE WHEN p_axis      >= 10000 THEN NULL ELSE p_axis      END AS p_axis,
+              CASE WHEN qrs_axis    >= 10000 THEN NULL ELSE qrs_axis    END AS qrs_axis,
+              CASE WHEN t_axis      >= 10000 THEN NULL ELSE t_axis      END AS t_axis
+          from `{physio_ecg}.machine_measurements` 
+
+        ) e
+          ON e.subject_id = c.subject_id
+          AND e.ecg_time BETWEEN c.admittime AND c.dischtime
+      ) t
+      WHERE rn = 1
+    )
+
+    -- STEP 6: Add icu stays of each patient's admission
+
+    , icu_summary as (
+      select 
+        subject_id,
+        hadm_id,
+        sum(los) as los_icu
+      FROM `{physio_icu}.icustays`
+      group by 1,2
+    )
+
+    -- STEP 7: Add lab data of each patient's admission
+
+    , lab_summary as (
+    WITH base_labs AS (
+      -- Filter for only the relevant IDs and normalize the naming
+      SELECT 
+        hadm_id, 
+        charttime, 
+        valuenum,
+        CASE 
+          -- High missingness (>40%) excluded:
+          -- WHEN itemid IN (51002, 52642) THEN 'troponin_i'
+          -- WHEN itemid = 51003 THEN 'troponin_t'
+          -- WHEN itemid = 51921 THEN 'probnp_pleural'
+          -- WHEN itemid = 50963 THEN 'ntprobnp'
+          -- WHEN itemid = 50905 THEN 'ldl_calculated'
+          -- WHEN itemid = 50906 THEN 'ldl_measured'
+          -- WHEN itemid = 50903 THEN 'cholesterol_ratio'
+          -- WHEN itemid = 50904 THEN 'hdl'
+          -- WHEN itemid = 51000 THEN 'triglycerides'
+          -- WHEN itemid = 52029 THEN 'ionized_calcium_percent'
+          -- WHEN itemid = 50910 THEN 'ck_total'
+          -- WHEN itemid IN (50911, 51595) THEN 'ck_mb'
+          -- WHEN itemid = 51594 THEN 'ck_bb'
+          -- WHEN itemid = 51596 THEN 'ck_mm'
+          -- WHEN itemid = 50861 THEN 'alt'
+          -- WHEN itemid = 50878 THEN 'ast'
+          -- WHEN itemid IN (50862, 52022, 53085, 53138) THEN 'albumin'
+
+          WHEN itemid IN (50971, 50822, 52452) THEN 'potassium'
+          WHEN itemid IN (50983, 52455, 52623, 50824) THEN 'sodium'
+          WHEN itemid IN (50893, 52034, 52035) THEN 'calcium_total'
+          WHEN itemid IN (51624, 50808) THEN 'calcium_free'
+          WHEN itemid = 50960 THEN 'magnesium'
+          WHEN itemid IN (52024, 52546, 50912) THEN 'creatinine'
+          WHEN itemid IN (52647, 51006) THEN 'bun'
+          WHEN itemid = 51222 THEN 'hemoglobin'
+          WHEN itemid IN (51221, 51638, 51639, 52028) THEN 'hematocrit'
+          WHEN itemid IN (51301, 51755, 51756) THEN 'wbc'
+          WHEN itemid IN (51265, 53189) THEN 'platelets'
+          WHEN itemid = 50882 THEN 'bicarbonate'
+          WHEN itemid IN (52500, 50868) THEN 'anion_gap'
+          WHEN itemid IN (50813, 52442, 53154) THEN 'lactate'
+          WHEN itemid IN (51237, 51675) THEN 'inrpt'
+          WHEN itemid = 51274 THEN 'pt'
+          WHEN itemid IN (50931, 52027, 52569, 50809) THEN 'glucose'
+          WHEN itemid IN (50902, 52434, 52535, 50806) THEN 'chloride'
+ 
+        END AS label
+      FROM `{physio_hosp}.labevents`
+      WHERE hadm_id IS NOT NULL
+        AND valuenum IS NOT NULL
+        AND itemid IN (
+          50971, 50822, 52452, 50983, 52455, 52623, 50824, 50893, 51624, 
+          52034, 50808, 52035, 50960, 52024, 52546, 50912, 52647, 51006, 
+          51222, 51221, 51638, 51639, 52028, 51301, 51755, 51756, 51265, 
+          53189, 50882, 52500, 50868, 50813, 52442, 53154, 51237, 51675, 
+          51274, 50931, 52027, 52569, 50809, 50902, 52434, 52535, 50806
+        )
+    ),
+    first_times AS (
+      SELECT 
+        hadm_id, 
+        label, 
+        MIN(charttime) AS first_charttime
+      FROM base_labs
+      GROUP BY hadm_id, label
+    ),
+    first_values AS (
+      SELECT 
+        bl.hadm_id, 
+        bl.label, 
+        AVG(bl.valuenum) AS first_val
+      FROM base_labs bl
+      INNER JOIN first_times ft
+        ON bl.hadm_id = ft.hadm_id 
+        AND bl.label = ft.label 
+        AND bl.charttime = ft.first_charttime
+      GROUP BY bl.hadm_id, bl.label
+    )
+    SELECT * FROM first_values
+    PIVOT(
+      AVG(first_val)
+      FOR label IN (
+        'potassium', 'sodium', 'calcium_total', 'calcium_free',
+        'magnesium', 'creatinine', 'bun', 'hemoglobin', 'hematocrit', 
+        'wbc', 'platelets', 'bicarbonate', 'anion_gap', 'lactate', 
+        'inrpt', 'pt', 'glucose', 'chloride'
+      )
+    )
+    )
+
+    -- STEP 8: Add ECG features of each patients
+    SELECT
+      # c.* except(rn),
+      c.*,
+      l.study_id,
+      l.ecg_time,
+      l.rr_interval,
+      # l.p_onset,
+      # l.p_end,
+      l.qrs_onset,
+      l.qrs_end,
+      l.t_end,
+      # l.p_axis,
+      l.qrs_axis,
+      l.t_axis,
+      l.ecg_heart_rate,
+      # p_dur,
+      qrs_dur,
+      qt_proxy,
+      t_dur,
+      p.gender,
+      EXTRACT(YEAR FROM admittime) - p.anchor_year + p.anchor_age as age,
+      case when los_icu is null then 0 else los_icu end as los_icu,
+      lb.* except(hadm_id)
+
+    FROM final_cohort c
+    LEFT JOIN last_ecg l
+      ON l.hadm_id = c.hadm_id
+    LEFT JOIN `{physio_hosp}.patients` p 
+      ON c.subject_id = p.subject_id
+    LEFT JOIN icu_summary i
+      ON i.hadm_id = c.hadm_id
+    LEFT JOIN lab_summary lb
+      ON lb.hadm_id = c.hadm_id
+      ;
+"
+
+cohort <- dbGetQuery(con_bq, glue(query))
+
+```
+
+```{r}
 library(comorbidity)
 
-mimic_dir <- "~/mimic"
-
-con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
-```
-
-Loading the relevant tables into DuckDB
-```{r}
-services_path   <- file.path(mimic_dir, "hosp", "services.csv.gz")
-admissions_path <- file.path(mimic_dir, "hosp", "admissions.csv.gz")
-patients_path   <- file.path(mimic_dir, "hosp", "patients.csv.gz")
-diagnoses_path  <- file.path(mimic_dir, "hosp", "diagnoses_icd.csv.gz")
-ecg_path        <- file.path(mimic_dir, "ecg", "machine_measurements.csv")
-icustays_path   <- file.path(mimic_dir, "icu", "icustays.csv.gz")
-
-
-dbExecute(con, glue::glue("
-  CREATE OR REPLACE VIEW services AS
-  SELECT * FROM read_csv_auto('{services_path}', header=true);
-
-  CREATE OR REPLACE VIEW admissions AS
-  SELECT * FROM read_csv_auto('{admissions_path}', header=true);
-
-  CREATE OR REPLACE VIEW patients AS
-  SELECT * FROM read_csv_auto('{patients_path}', header=true);
-
-  CREATE OR REPLACE VIEW diagnoses AS
-  SELECT * FROM read_csv_auto('{diagnoses_path}', header=true);
-  
-  CREATE OR REPLACE VIEW ecg_mm AS
-  SELECT * FROM read_csv_auto('{ecg_path}', header=true);
-
-  CREATE OR REPLACE VIEW icustays AS
-  SELECT * FROM read_csv_auto('{icustays_path}', header=true);
-"))
-```
-
-Filtering services to only include CSURG as current or previous service
-```{r}
-dbExecute(con, "DROP TABLE IF EXISTS csurg_adm;")
-
-dbExecute(con, "
-  CREATE TEMP TABLE csurg_adm AS
-  SELECT
-    a.subject_id,
-    a.hadm_id,
-    a.admittime,
-    a.dischtime,
-    a.hospital_expire_flag,
-    a.discharge_location,
-    a.insurance,
-    a.language,
-    a.marital_status,
-    a.race,
-    a.edregtime,
-    a.edouttime,
-    a.hospital_expire_flag
-  FROM admissions a
-  WHERE a.admittime IS NOT NULL
-    AND a.dischtime IS NOT NULL
-    AND a.hospital_expire_flag = 0
-    AND EXISTS (
-      SELECT 1
-      FROM services s
-      WHERE s.hadm_id = a.hadm_id
-        AND (s.curr_service = 'CSURG' OR s.prev_service = 'CSURG')
-    );
-")
-```
-- There are 13,350 patients in the CSURG cohort before filtering further
-
-Filtering the CSURG admissions to only those that have an ECG measurement during the hospital stay
-```{r}
-dbExecute(con, "DROP TABLE IF EXISTS csurg_ecg;")
-
-dbExecute(con, "
-  CREATE TEMP TABLE csurg_ecg AS
-  SELECT
-    c.*
-  FROM csurg_adm c
-  WHERE EXISTS (
-    SELECT 1
-    FROM ecg_mm e
-    WHERE e.subject_id = c.subject_id
-      AND e.ecg_time BETWEEN c.admittime AND c.dischtime
-  );
-")
-```
-- There are now 8,491 patients
-
-Creating columns for: next admit time (if applicable), time to next admission, and 30-day readmission binary label
-```{r}
-dbExecute(con, "DROP TABLE IF EXISTS readmit_labels;")
-
-dbExecute(con, "
-  CREATE TEMP TABLE readmit_labels AS
-  WITH next_adm AS (
-    SELECT
-      i.subject_id,
-      i.hadm_id AS index_hadm_id,
-      i.dischtime AS index_dischtime,
-      MIN(a.admittime) AS next_admittime
-    FROM csurg_ecg i
-    LEFT JOIN admissions a
-      ON a.subject_id = i.subject_id
-     AND a.admittime > i.dischtime
-    GROUP BY i.subject_id, i.hadm_id, i.dischtime
-  )
-  SELECT
-    i.*,
-    n.next_admittime,
-    DATE_DIFF('hour', i.dischtime, n.next_admittime) AS hours_to_next,
-    CASE
-      WHEN n.next_admittime IS NULL THEN 0
-      WHEN DATE_DIFF('hour', i.dischtime, n.next_admittime) <= 24 THEN NULL
-      WHEN DATE_DIFF('day',  i.dischtime, n.next_admittime) <= 30 THEN 1
-      ELSE 0
-    END AS readmit_30d
-  FROM csurg_ecg i
-  LEFT JOIN next_adm n
-    ON n.index_hadm_id = i.hadm_id;
-")
-```
-
-Gathering sums for each readmission category to understand the distribution of our outcome variable
-```{r}
-dbGetQuery(con, "
-  SELECT
-    SUM(CASE WHEN next_admittime IS NULL THEN 1 ELSE 0 END) AS no_next_adm,
-    SUM(CASE WHEN hours_to_next <= 24 THEN 1 ELSE 0 END) AS le_24h,
-    SUM(CASE WHEN hours_to_next > 24 AND hours_to_next <= 24*30 THEN 1 ELSE 0 END) AS readmit_30d_window,
-    SUM(CASE WHEN hours_to_next > 24*30 THEN 1 ELSE 0 END) AS after_30d
-  FROM readmit_labels;
-")
-```
-- No readmission: 4,577
-- Readmission within 24h “bounce-back” (will be excluded): 67
-- Readmission between 24h and 30d: 1,280
-- Readmission greater than 30d: 2,567
-
-Excluding readmission within 24 hrs
-```{r}
-dbExecute(con, "DROP TABLE IF EXISTS final_cohort;")
-
-dbExecute(con, "
-  CREATE TEMP TABLE final_cohort AS
-  SELECT *
-  FROM readmit_labels
-  WHERE hours_to_next IS NULL OR hours_to_next > 24;
-");
-```
-- This brings our cohort down to 8424 patients
-
-Selecting last ECG measurement during the hospital stay for each admission
-```{r}
-dbExecute(con, "DROP TABLE IF EXISTS last_ecg;")
-
-dbExecute(con, "
-  CREATE TEMP TABLE last_ecg AS
-  SELECT *
-  FROM (
-    SELECT
-      c.hadm_id,
-      c.subject_id,
-      c.admittime,
-      c.dischtime,
-      e.study_id,
-      e.ecg_time,
-      e.rr_interval,
-      e.p_onset,
-      e.p_end,
-      e.qrs_onset,
-      e.qrs_end,
-      e.t_end,
-      e.p_axis,
-      e.qrs_axis,
-      e.t_axis,
-
-      ROW_NUMBER() OVER (
-        PARTITION BY c.hadm_id
-        ORDER BY e.ecg_time DESC
-      ) AS rn
-    FROM final_cohort c
-    JOIN ecg_mm e
-      ON e.subject_id = c.subject_id
-     AND e.ecg_time BETWEEN c.admittime AND c.dischtime
-  ) t
-  WHERE rn = 1;
-")
-```
-
-Adding diagnoses to the final cohort
-```{r}
-dbExecute(con, "DROP TABLE IF EXISTS dx_cohort;")
-
-dbExecute(con, "
-  CREATE TEMP TABLE dx_cohort AS
+query_diag <- "
   SELECT
     d.subject_id,
     d.hadm_id,
     d.icd_code,
     d.icd_version
-  FROM diagnoses d
-  JOIN final_cohort c
-    ON c.hadm_id = d.hadm_id
+  FROM `{physio_hosp}.diagnoses_icd` d
   WHERE d.icd_code IS NOT NULL;
-")
-```
+  "
+dx <- dbGetQuery(con_bq, glue(query_diag)) |>
+  filter(hadm_id %in% cohort$hadm_id)
 
-Creating tibble for diagnoses and seeing how many ICD9 vs ICD10 codes in the cohort
-```{r}
-dx <- tbl(con, "dx_cohort") |> collect()
-
-dx |> count(icd_version)
-```
-- There are 76,972 ICD9 codes
-- There are 45,758 ICD10 codes
-
-Generating elixhauser comorbidity index by ICD9 and ICD10 codes separately
-```{r}
 dx9  <- dx |> filter(icd_version == 9)
 dx10 <- dx |> filter(icd_version == 10)
 
@@ -262,10 +377,6 @@ elix10 <- if (nrow(dx10) > 0) {
   NULL
 }
 
-```
-
-Combine and collapse to one row per hadm_id
-```{r}
 elix_all <- bind_rows(elix9, elix10) |>
   group_by(hadm_id) |>
   summarise(across(where(is.numeric), ~max(.x, na.rm = TRUE)), .groups = "drop")
@@ -274,178 +385,139 @@ nrow(elix_all)
 n_distinct(elix_all$hadm_id)
 ```
 
-Joining all the data together to create the final dataset for modeling. This will include the last ECG measurement for each admission, along with the readmission label and any other relevant features from the admissions, patients, and diagnoses tables. We will create a temporary table `final_dataset` that contains all the necessary information for modeling.
 ```{r}
-dbExecute(con, "DROP TABLE IF EXISTS final_tbl;")
 
-dbExecute(con, "
-  CREATE TEMP TABLE final_tbl AS
-  SELECT
-    c.*,
-    l.study_id,
-    l.ecg_time,
-    l.rr_interval,
-    l.p_onset,
-    l.p_end,
-    l.qrs_onset,
-    l.qrs_end,
-    l.t_end,
-    l.p_axis,
-    l.qrs_axis,
-    l.t_axis
-  FROM final_cohort c
-  LEFT JOIN last_ecg l
-    ON l.hadm_id = c.hadm_id;
-")
-```
-
-Pulling cohort into a tibble to use for modeling
-```{r}
-cohort <- tbl(con, "final_tbl") |> collect()
-
-nrow(cohort)
-n_distinct(cohort$hadm_id)
-n_distinct(cohort$subject_id)
-head(cohort)
-
-# cohort_final <- cohort |> left_join(elix_all, by = "hadm_id")
-```
-
-```{r}
-icu_summary <- tbl(con, "icustays") %>%
-  collect() %>%
-  group_by(subject_id, hadm_id) %>%
-  summarise(
-    icu_los_total = sum(los, na.rm = TRUE),
-    n_icu_stays = n(),
-    # icu_los_mean = mean(los, na.rm = TRUE),
-    # icu_first_careunit = first(first_careunit),
-    # icu_last_careunit  = last(last_careunit),
-    .groups = "drop"
-  )
-```
-
-```{r}
-# cohort <- tbl(con, "final_tbl") |> collect()
-
-cohort_final <- cohort |> 
+cohort_final <- cohort |>
   left_join(elix_all, by = "hadm_id") |>
-  left_join(tbl(con, "patients") |> collect() |> select(subject_id, gender,
-    anchor_age, anchor_year, anchor_year_group), by = "subject_id") |>
-  # left_join(tbl(con, "icustays") |> collect() |> select(subject_id, hadm_id,
-  #   first_careunit, last_careunit, los), by = c("subject_id", "hadm_id")) |>
-  left_join(icu_summary, by = c("subject_id", "hadm_id")) |>
-  # rename(icu_first_careunit = first_careunit,
-  #   icu_last_careunit = last_careunit,
-  #   icu_los = los) |>
-  mutate(ed_los = as.numeric(difftime(edouttime, edregtime, units = "hours")),
-    hosp_los = as.numeric(difftime(dischtime, admittime, units = "hours"))
-    # , icu_yn = if_else(!is.na(icu_first_careunit), 1, 0)
-    ) |>
-  distinct(subject_id, hadm_id, .keep_all = TRUE) 
-  # |>
-  # select(-hospital_expire_flag, -hospital_expire_flag_1)
-  
+  mutate(
+    admission_type = fct_lump_n(admission_type, n = 5, other_level = "Other"),
+    admission_location = fct_lump_n(admission_location, n = 5, other_level = "Other"),
+    discharge_location = fct_lump_n(discharge_location, n = 5, other_level = "Other"),
+    language = fct_lump_n(language, n = 5, other_level = "Other"),
+    race = fct_collapse(
+      race,
+      ASIAN = c(
+        "ASIAN", 
+        "ASIAN - ASIAN INDIAN", 
+        "ASIAN - CHINESE", 
+        "ASIAN - KOREAN", 
+        "ASIAN - SOUTH EAST ASIAN"
+      ),
+      BLACK = c(
+        "BLACK/AFRICAN", 
+        "BLACK/AFRICAN AMERICAN", 
+        "BLACK/CAPE VERDEAN", 
+        "BLACK/CARIBBEAN ISLAND"
+      ),
+      HISPANIC = c(
+        "HISPANIC OR LATINO", 
+        "HISPANIC/LATINO - CENTRAL AMERICAN", 
+        "HISPANIC/LATINO - COLUMBIAN", 
+        "HISPANIC/LATINO - CUBAN", 
+        "HISPANIC/LATINO - DOMINICAN", 
+        "HISPANIC/LATINO - GUATEMALAN", 
+        "HISPANIC/LATINO - HONDURAN", 
+        "HISPANIC/LATINO - MEXICAN", 
+        "HISPANIC/LATINO - PUERTO RICAN", 
+        "HISPANIC/LATINO - SALVADORAN",
+        "SOUTH AMERICAN"
+      ),
+      WHITE = c(
+        "WHITE", 
+        "WHITE - BRAZILIAN", 
+        "WHITE - EASTERN EUROPEAN", 
+        "WHITE - OTHER EUROPEAN", 
+        "WHITE - RUSSIAN"
+      ),
+      Other = c(
+        "AMERICAN INDIAN/ALASKA NATIVE", 
+        "MULTIPLE RACE/ETHNICITY", 
+        "NATIVE HAWAIIAN OR OTHER PACIFIC ISLANDER", 
+        "OTHER", 
+        "PATIENT DECLINED TO ANSWER", 
+        "PORTUGUESE", 
+        "UNABLE TO OBTAIN", 
+        "UNKNOWN"
+      ))
+    )
+
+nrow(cohort_final)
+dplyr::n_distinct(cohort_final$subject_id)
 ```
 
 ```{r}
-# cohort_final$hospital_expire_flag
-# cohort_final$hospital_expire_flag_1
+write_csv(cohort_final, "cohort_final.csv")
+```
+
+```{r}
+cohort_final <- cohort_final |>
+  mutate(readmit_30d = factor(readmit_30d, levels = c("0", "1")))
+
+str(cohort_final)
 summary(cohort_final)
 ```
 
 ```{r}
 str(cohort_final)
 nrow(cohort_final)
+ncol(cohort_final)
 n_distinct(cohort_final$hadm_id)
 n_distinct(cohort_final$subject_id)
-head(cohort_final)
-```
-```{r}
-library(tableone)
-desc_table <- CreateTableOne(data = cohort_final |> select(-subject_id, -hadm_id, -study_id, -next_admittime),
-  strata = "readmit_30d",
-  test = TRUE,
-  smd = TRUE
-)
-desc_table1 <- print(desc_table, showAllLevels = TRUE, quote = TRUE, nospaces = TRUE)
-
-write.csv(desc_table1, file = "descriptive_table.csv", row.names = TRUE)
-
 ```
 
 ```{r}
 library(gtsummary)
 desc_table2 <- cohort_final |> 
-  select(-subject_id, -hadm_id, -study_id, -next_admittime) |> 
-  tbl_summary(by = readmit_30d, missing = "no") |> 
-  add_p() |> 
+  select(-subject_id, -hadm_id, -study_id, 
+    -next_admittime, -admittime, -dischtime, 
+    -ecg_time, -hours_to_next, -hospital_expire_flag) |> 
+  tbl_summary(by = readmit_30d, missing = "ifany") |> 
   add_overall() |> 
   add_n() |> 
   bold_labels()
-```
 
-```{r}
-cohort_final <- cohort_final |> 
-  mutate(readmit_30d = as.factor(cohort_final$readmit_30d))
-str(cohort_final)
-```
-
-```{r}
-nrow(cohort_final)
-dplyr::n_distinct(cohort_final$hadm_id)
-dplyr::n_distinct(cohort_final$subject_id)
-```
-
-```{r}
-library(recipes)
-library(tidymodels)
-library(themis)    
-set.seed(123)
-
-rec <- recipe(readmit_30d ~ ., data = cohort_final) %>%
-  
-  # remove IDs / leakage variables
-  step_rm(subject_id, hadm_id, study_id, next_admittime) %>%
-  
-  # # convert datetime → useful numeric features
-  # step_mutate(
-  #   los_hours = as.numeric(dischtime - admittime, units = "hours")
-  #   # ,
-  #   # ecg_to_admit = as.numeric(ecg_time - admittime, units = "hours")
-  # ) %>%
-  
-  # remove raw datetime columns
-  step_rm(admittime, dischtime, ecg_time, edregtime, edouttime) %>%
-
-  # remov unnecessary variables that won't be used in modeling
-  step_rm(hours_to_next, anchor_year) %>%
-
-  # handle categorical variables
-  step_string2factor(all_nominal_predictors()) %>%
-  step_other(all_nominal_predictors(), threshold = 0.01) %>%
-  step_unknown(all_nominal_predictors()) %>%
-  step_dummy(all_nominal_predictors()) %>%
-  
-  # impute missing values
-  step_impute_median(all_numeric_predictors()) %>%
-  
-  # remove constant predictors
-  step_zv(all_predictors()) %>%
-  
-  # normalize numeric predictors (optional but often helpful)
-  step_normalize(all_numeric_predictors()) 
-  # %>%
-
-  # # # handle imbalance
-  # step_smote(readmit_30d)
+desc_table2
 ```
 
 ```{r}
 split <- initial_split(cohort_final, prop = 0.8, strata = readmit_30d)
-
 train_data <- training(split)
 test_data  <- testing(split)
+```
+
+
+```{r}
+library(recipes)
+set.seed(123)
+
+rec <- recipe(readmit_30d ~ ., data = train_data) |>
+  
+  # remove IDs and datetime variable
+  step_rm(subject_id, hadm_id, study_id, next_admittime, admittime, dischtime, ecg_time, hours_to_next, hospital_expire_flag) |>
+
+  # handle categorical variables
+  step_string2factor(all_nominal_predictors()) |>
+  step_other(all_nominal_predictors(), threshold = 0.05) |>
+  step_unknown(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) |>
+  
+  # remove constant and near zero variance predictors
+  step_zv(all_predictors()) |>
+  step_nzv(all_predictors()) |>  
+  
+  # handle numerical variables
+  # step_corr(all_numeric_predictors(), threshold = 0.9) |>
+  step_impute_knn(all_numeric_predictors()) |> #impute missing values for numeric variables using KNN
+  step_normalize(all_numeric_predictors())
+  # |>
+  # step_smote(readmit_30d) # handle class imbalance
+```
+
+```{r}
+# prepped_data <- prep(rec)
+# cohort_final_cleaned <- bake(prepped_data, new_data = NULL)
+# summary(cohort_final_cleaned)
+# str(cohort_final_cleaned)
 ```
 
 ```{r}
@@ -453,61 +525,186 @@ xgb_model <- boost_tree(
   learn_rate = tune(),
   tree_depth = tune(),
   trees = tune()
-  # sample_size = tune(),
-  # min_n = tune(),
-  # loss_reduction = tune()
 ) %>%
   set_engine("xgboost") %>%
   set_mode("classification")
+
+rf_model <- rand_forest(
+  mtry = tune(),    
+  trees = tune(),    
+  min_n = tune()     
+) %>%
+  set_engine("randomForest") %>% 
+  set_mode("classification")
+
+log_model <- logistic_reg(
+  penalty = tune(),   
+  mixture = tune()    
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+
 ```
 
 ```{r}
-wf <- workflow() %>%
+wf_log <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(log_model)
+  
+wf_rf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(rf_model)
+
+wf_xgb <- workflow() %>%
   add_recipe(rec) %>%
   add_model(xgb_model)
 ```
-```{r}
-folds <- vfold_cv(train_data, v = 10, strata = readmit_30d)
-```
-```{r}
-# grid <- grid_latin_hypercube(
-#   learn_rate(),
-#   tree_depth(),
-#   trees(),
-#   sample_prop(),
-#   min_n(),
-#   loss_reduction(),
-#   size = 20
-# )
 
-grid <- grid_regular(
+
+```{r}
+folds <- vfold_cv(train_data, v = 5, strata = readmit_30d)
+```
+
+```{r}
+
+log_grid <- grid_regular(
+  penalty(range = c(-4, 0)),   
+  mixture(range = c(0, 1)),    
+  levels = 5
+)
+
+rf_grid <- grid_regular(
+  mtry(range = c(1L, 20L)),    
+  trees(range = c(50L, 500L)),
+  min_n(range = c(1L, 20L)),
+  levels = 5
+)
+
+xgb_grid <- grid_regular(
   learn_rate(range = c(-2, -1)),
-  tree_depth(range = c(3L, 10L)),
-  trees(range = c(50L, 1000L))
+  tree_depth(range = c(1L, 10L)),
+  trees(range = c(50L, 500L)),
+  levels = 5
 )
 
 ```
+
 ```{r}
-tune_res <- tune_grid(
-  wf,
+library(future)
+plan(multisession, workers = parallel::detectCores() - 1)
+
+ctrl <- control_grid(
+  verbose = TRUE,
+  allow_par = TRUE,
+  parallel_over = "everything"  
+)
+
+tune_res_log <- tune_grid(
+  wf_log,
   resamples = folds,
-  grid = grid,
-  metrics = metric_set(roc_auc)
+  grid = log_grid,
+  metrics = metric_set(roc_auc),
+  control = ctrl
 )
 
-# tune_res
+tune_res_rf <- tune_grid(
+  wf_rf,
+  resamples = folds,
+  grid = rf_grid,
+  metrics = metric_set(roc_auc),
+  control = ctrl
+)
+
+tune_res_xgb <- tune_grid(
+  wf_xgb,
+  resamples = folds,
+  grid = xgb_grid,
+  metrics = metric_set(roc_auc),
+  control = ctrl
+)
 ```
 
 ```{r}
-best_params <- select_best(tune_res, metric = "roc_auc")
+best_params_log <- select_best(tune_res_log, metric = "roc_auc")
 
-all_results <- tune_res %>%
+all_results_log <- tune_res_log %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(penalty, mixture, mean, .metric, .estimator, n, std_err, .config) %>%
+  arrange(desc(mean))
+
+best_params_rf <- select_best(tune_res_rf, metric = "roc_auc")
+
+all_results_rf <- tune_res_rf %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mtry, trees, min_n, mean, .metric, .estimator, n, std_err, .config) %>%
+  arrange(desc(mean))
+
+best_params_xgb <- select_best(tune_res_xgb, metric = "roc_auc")
+
+all_results_xgb <- tune_res_xgb %>%
   collect_metrics() %>%
   filter(.metric == "roc_auc") %>%
   select(learn_rate, tree_depth, trees, mean, .metric, .estimator, n, std_err, .config) %>%
   arrange(desc(mean))
 
-print(all_results, n = nrow(all_results))
+print("Logistic Regression Results:")
+print(all_results_log, n = nrow(all_results_log))
+print("Random Forest Results:")
+print(all_results_rf, n = nrow(all_results_rf))
+print("XGBoost Results:")
+print(all_results_xgb, n = nrow(all_results_xgb))
+
+```
+
+```{r}
+# Logistic Regression Line plot: ROC-AUC vs Penalty for different mixture values
+plot_log <- ggplot(all_results_log, aes(x = penalty, y = mean, color = factor(mixture), 
+                              group = mixture)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_x_log10() +
+  labs(title = "Logistic Regression ROC-AUC vs Penalty Across Mixture Values",
+       x = "Penalty (log scale)", y = "ROC-AUC",
+       color = "Mixture") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_color_viridis_d()
+
+print(plot_log)
+
+# Random Forest Boxplot: Distribution of ROC-AUC by trees
+plot_rf <- ggplot(all_results_rf, aes(x = factor(trees), y = mean, fill = factor(trees))) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 1) +
+  scale_fill_viridis_d() +
+  labs(title = "Random Forest ROC-AUC Distribution by Number of Trees",
+       x = "Number of Trees", y = "ROC-AUC") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+print(plot_rf)
+
+# XGBoost Line plot: ROC-AUC vs Learn Rate for different Tree Depths
+plot_xgb <- ggplot(all_results_xgb, aes(x = learn_rate, y = mean, color = factor(tree_depth), group = tree_depth)) +
+  geom_smooth(se = FALSE, method = "loess", size = 1) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  scale_x_log10() +
+  scale_color_viridis_d(name = "Tree Depth") +
+  labs(title = "XGBoost ROC-AUC vs Learn Rate Across Different Tree Depths",
+       x = "Learn Rate (log scale)", y = "ROC-AUC") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(plot_xgb)
+```
+
+```{r}
+write_csv(all_results_log, file = "all_results_log.csv")
+write_csv(all_results_rf, file = "all_results_rf.csv")
+write_csv(all_results_xgb, file = "all_results_xgb.csv")
 ```
 
 
@@ -515,29 +712,272 @@ print(all_results, n = nrow(all_results))
 my_metrics <- metric_set(
   roc_auc,
   pr_auc,
-  sens,
-  spec,
   accuracy,
   ppv,
   npv
 )
 
-final_wf <- finalize_workflow(wf, best_params)
+final_wf_log <- finalize_workflow(wf_log, best_params_log)
+final_wf_rf <- finalize_workflow(wf_rf, best_params_rf)
+final_wf_xgb <- finalize_workflow(wf_xgb, best_params_xgb)
 
-final_fit <- final_wf %>%
+final_fit_log <- final_wf_log %>%
   last_fit(split, metrics = my_metrics)
-```
+final_fit_rf <- final_wf_rf %>%
+  last_fit(split, metrics = my_metrics)
+final_fit_xgb <- final_wf_xgb %>%
+  last_fit(split, metrics = my_metrics)
 
+print("Final Logistic Regression Metrics:")
+collect_metrics(final_fit_log)
+print("Final Random Forest Metrics:")
+collect_metrics(final_fit_rf)
+print("Final XGBoost Metrics:")
+collect_metrics(final_fit_xgb)
+```
 
 ```{r}
-collect_metrics(final_fit)
+library(yardstick)
+
+# Collect predictions from all models
+predictions_log <- final_fit_log %>%
+  collect_predictions() %>%
+  mutate(model = "Logistic Regression")
+
+predictions_rf <- final_fit_rf %>%
+  collect_predictions() %>%
+  mutate(model = "Random Forest")
+
+predictions_xgb <- final_fit_xgb %>%
+  collect_predictions() %>%
+  mutate(model = "XGBoost")
+
+# Combine all predictions
+all_predictions <- bind_rows(predictions_log, predictions_rf, predictions_xgb)
+
+# Calculate AUC for each model
+auc_values <- all_predictions %>%
+  group_by(model) %>%
+  roc_auc(truth = readmit_30d, .pred_0) %>%
+  mutate(auc_label = paste(model, "- AUC =", round(.estimate, 3)))
+
+# Create ROC curves for all models
+roc_data <- all_predictions %>%
+  group_by(model) %>%
+  roc_curve(truth = readmit_30d, .pred_0)
+
+# Plot combined ROC curves
+auc_curve_plot <- ggplot(roc_data, aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_line(size = 1.2) +
+  geom_abline(linetype = "dashed", color = "gray50", alpha = 0.8) +
+  coord_equal() +
+  scale_color_manual(
+    values = c("Logistic Regression" = "#2E86AB", 
+               "Random Forest" = "#A23B72", 
+               "XGBoost" = "#F18F01"),
+    labels = c(
+      paste0("Logistic Regression (AUC = ", 
+             round(filter(auc_values, model == "Logistic Regression")$.estimate, 3), ")"),
+      paste0("Random Forest (AUC = ", 
+             round(filter(auc_values, model == "Random Forest")$.estimate, 3), ")"),
+      paste0("XGBoost (AUC = ", 
+             round(filter(auc_values, model == "XGBoost")$.estimate, 3), ")")
+    )
+  ) +
+  labs(
+    title = "ROC Curves - Model Comparison",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Model"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
 ```
 
+``` {r}
+library(ggplot2)
+library(dplyr)
+library(broom)
+
+final_model_log <- extract_fit_parsnip(final_fit_log$.workflow[[1]])
+
+importance_data <- tidy(final_model_log) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    odds_ratio = exp(estimate),
+    direction = ifelse(odds_ratio > 1, "Increase Odds", "Decrease Odds"),
+    label_text = round(odds_ratio, 2)
+  ) %>%
+  group_by(direction) %>%
+  slice_max(abs(estimate), n = 10) %>%
+  ungroup()
+
+ggplot(importance_data, aes(x = reorder(term, odds_ratio), y = odds_ratio, fill = direction)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = label_text), 
+            hjust = ifelse(importance_data$odds_ratio > 1, -0.1, 1.1), 
+            size = 3.5, 
+            fontface = "bold") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+  coord_flip() +
+  scale_y_log10(expand = expansion(mult = c(0.2, 0.2))) + 
+  scale_fill_manual(values = c("Increase Odds" = "#e67e22", "Decrease Odds" = "#3498db")) +
+  labs(
+    title = "Feature Importance: Odds Ratios",
+    subtitle = "Blue: Higher odds | Orange: Lower odds (Reference line at 1.0)",
+    x = NULL,
+    y = "Odds Ratio (Log Scale)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(face = "bold")
+  )
+```
 
 ```{r}
 library(vip)
 
-final_model <- extract_fit_parsnip(final_fit$.workflow[[1]])
+final_model_rf <- extract_fit_parsnip(final_fit_rf$.workflow[[1]])
+final_model_xgb <- extract_fit_parsnip(final_fit_xgb$.workflow[[1]])
 
-vip(final_model)
+vip(final_model_rf)
+vip(final_model_xgb)
 ```
+
+
+# 1. Title Page
+- Project title: "Predicting 30-Day Readmission After Cardiac Surgery Using MIMIC-IV Dataset"
+- Your team members: Yash Motwani, Sofia Landinez, and Mert Cumhur
+
+# 2. Abstract
+Provide a succinct summary of your entire project (~250–300 words), including:
+- Background – Context and why the problem matters
+- Objectives – What your project intends to investigate
+- Methods – Main approach and data sources
+- Results – Key findings
+- Conclusion – Implications and potential impact
+
+Abstract
+Background:  Hospital readmission within 30 days of discharge is a common among patients undergoing cardiac surgery. By indentifying patients at high risk for readmission, healthcare providers can implement targeted interventions to improve post-discharge care and reduce preventable readmissions.
+
+Objectives: The goal of this project is to develop and validate predictive models for 30-day hospital readmission following cardiac-surgery patients who underwent an EKG during their hospital stay. 
+
+Methods: 
+This study was conducted utilizing MIMIC-IV datasets that are focused on electronic health record data from cardiac-surgery patients with an EKG examination. This include patient demographics, hospital stay details, comorbidities, EKG features, and laboratory results. 7000 patients of cardiac surgery were included in the final cohort, with 15% experiencing readmission within 30 days. Three predictive classification models were developed: a logistic regression, a random forest, and an XGBoost model. Performance was evaluated using the area under the receiver operating characteristic curve (ROC AUC), with feature importance assessed to identify key predictors.
+
+Results: The XGBoost model achieved the highest performance, resulting a ROC AUC of 0.632. This moderate performance suggests that while readmission risk among cardiac surgery patient is complex, structured medical record data from EKGs and the associated hospital stay contain a measurable signal. Preliminary feature importance analysis indicated that elements length of stay, specific EKG abnormalities, and demographics were among the strongest predictors.
+
+Conclusion: This study demonstrates that machine learning models using readily available clinical data can moderately predict 30-day readmission in high-risk cardiac-surgery patients with an EKG. A ROC AUC of 0.632 is starting point for identifying patients who may benefit from enhanced discharge planning. Future work to improve predictive performance will focus on integrating hospital recharge note, EKG results note from physicians, and a more comprehensive set of social determinants of health.
+
+
+
+
+
+# 3. Introduction
+Establish your project’s rationale and research gap.
+
+## 3.1 Background
+
+  Hospital readmission within 30 days of discharge is happening in approximately 15-20% of patients undergoing cardiac surgery in the US. It is associated with increased healthcare costs, patient morbidity, and mortality.  The Centers for Medicare and Medicaid Services Readmission Reduction Program was initiated on October 1, 2012, as part of the Affordable Care Act. This program administers penalties of Medicare revenue for an excess 30-day readmission rate in the categories of heart failure and myocardial infarction.
+  
+  Identifying patients at high risk for readmission can enable healthcare providers to implement targeted interventions, such as enhanced discharge planning, post-discharge follow-up, and patient education, to improve outcomes and reduce preventable readmissions. Despite the importance of this issue, accurately predicting which patients are at risk for readmission remains a challenge. Previous studies have explored various clinical and demographic factors associated with readmission risk, but there is a need for more comprehensive models that integrate structured data from electronic health records (EHRs), including EKG features and hospital stay details, to improve predictive performance. This project aims to fill this gap by developing and validating machine learning models that utilize structured EHR data to predict 30-day readmission after cardiac surgery.
+
+  The hypothesis of this project is that machine learning models can predict 30-day readmission after cardiac surgery using structured data from EKGs and associated hospital stay details, with the expectation that the models will achieve a ROC AUC of at least 0.65, indicating the typical performance of such readmission prediction models.
+
+  https://www.cms.gov/medicare/payment/prospective-payment-systems/acute-inpatient-pps/hospital-readmissions-reduction-program-hrrp 
+  https://pmc.ncbi.nlm.nih.gov/articles/PMC7382395
+  https://pmc.ncbi.nlm.nih.gov/articles/PMC4186890/ 
+
+# 4. Methods
+
+
+## 4.1 Data Source or Materials
+
+This study was conducted utilizing MIMIC-IV datasets that are focused on electronic health record data from cardiac-surgery patients with an inpatient EKG. The datasets were accessed through BigQuery, and the analysis was performed using R. The study cohort included adult patients who underwent cardiac surgery and had at least one EKG examination during their hospital stay. The exclusion criteria included patients who died during the index hospitalization, those with missing discharge timestamps, and those who were discharged to hospice care or palliative care. There are 8167 admissions of 7640 patients of cardiac surgery included in the final cohort, with 15% experiencing readmission within 30 days. The data access and analysis were conducted in compliance with the MIMIC-IV data use agreement, ensuring patient privacy and appropriate use of the data. All analyses were performed on de-identified data, and the study was approved by the relevant institutional review board, and can be accessed through BigQuery after submitting a data use request.
+
+## 4.2 Variables / Features
+
+There are total 70 features included in the final model, which are patient demographics, hospital stay details, comorbidities, EKG features, and laboratory results. Demographics data are taken from the patient records. They are consumed to understand the socioeconomic and health background of the patients, which can influence readmission risk. Hospital stay details are taken from the admissions table, including length of stay, admission type, admission location, discharge location, insurance. To get length of stay in ICU, we consume ICU stays table. Hospital stay details are important because they can reflect the severity of illness and the complexity of care, which are often associated with readmission risk. Comorbidity features were derived using the Elixhauser comorbidity index, which is a widely used method for quantifying patient comorbidities based on ICD diagnosis codes. Comorbidities are important predictors of readmission risk, as patients with multiple or severe comorbid conditions are more likely to experience complications and require readmission. EKG features were extracted from machine measurements table, and take the last EKG performed during the hospital stay, between admitted and discharged. After excluding raw EKG column that have high rate of missing data, derived features are calculated, such as heart rate, QRS duration, QT interval, and T wave abnormalities. These features are relevant because they can indicate underlying cardiac conditions and abnormalities that may contribute to readmission risk. Laboratory results included key biomarkers that related with cardiac issues, such as potassium, sodium, calcium, creatinine, and hemoglobin levels. They are important predictors of readmission risk, as abnormal values can indicate ongoing health issues or complications that may lead to readmission.
+
+The features were processed using a combination of imputation for missing values, normalization for numerical variables, and encoding for categorical variables. For example, categorical variables were transformed using one-hot encoding, while numerical variables were normalized to ensure they were on a comparable scale for modeling. The processing steps were implemented using the `recipes` package in R, which allowed for a systematic and reproducible approach to data preprocessing.
+
+## 4.3 Analytical Approach / Modeling
+
+The index time was defined as the discharge time of the cardiac surgery admission, with a prediction window of 30 days for readmission. The outcome variable was defined as a binary indicator of whether the patient was readmitted to the hospital within 30 days of discharge from the index cardiac surgery admission. They were discharge under 24 hours were not considered as readmission.
+
+Three predictive classification models were developed: a logistic regression model, a random forest, and an XGBoost. Model were developed in R, utilizing package mainly tidyverse and tidymodels workflow. After that, performance was evaluated using the area under the receiver operating characteristic curve (ROC AUC), with feature importance assessed to identify key predictors.
+
+All the parameters tuning are using grid search with 5-fold cross validation. The best model is selected based on the highest ROC AUC. In logistic regression, we used regularization strength (penalty or lambda) to control the amount of flexibility applied to prevent overfitting and the elastic net mixing parameter (mixture or alpha) which is a number between 0 and 1, where 0 corresponds to pure ridge regression and 1 corresponds to pure lasso regression, to balance between two types of regularization and achieve better predictive performance. 
+
+For random forest, we tuned the feature randomness (mtry), tree complexity (min_n), and ensemble size which is number of trees (trees). These three parameters are chosen because they are the core parameters, as stated in the official documentation of randomForest package and other research paper by Ishwaran, that control the randomness, complexity, and size of the random forest model, which are crucial for optimizing its performance and preventing overfitting.
+
+For XGBoost, we tuned the learning rate, maximum depth, and number of trees. They are the core parameters that control the learning process, model complexity, and ensemble size of the XGBoost model, which are essential for optimizing its performance and preventing overfitting. They are chosen based on the official documentation of xgboost package and other research paper by Chen and Guestrin.
+
+https://xgboost.readthedocs.io/en/latest/tutorials/param_tuning.html?from_column=20423&from=20423#control-overfitting 
+https://parsnip.tidymodels.org/reference/rand_forest.html
+https://zbmath.org/?q=an:07260271 
+https://iwaponline.com/view-large/3703360 
+https://arxiv.org/abs/1603.02754 
+
+## 4.4 Model Evaluation
+- Performance metrics (e.g., ROC/AUC, accuracy)
+- Validation methods (train/test split, cross-validation, etc.)
+
+After training those three models with 5-fold cross-validation and utilizing hyperparameter tuning, we evaluated their performance on the test set. The primary performance metric used for model evaluation was the area under the receiver operating characteristic curve (ROC AUC), which measures the model's ability to discriminate between patients who were readmitted and those who were not. Additionally, we calculated other metrics such as accuracy, ppv, and npv to provide a comprehensive assessment of model performance. The final models were compared based on their ROC AUC values, with the best-performing model selected for further analysis and interpretation. 
+
+# 5. Results
+State your findings clearly and objectively. Provide tables and figures where appropriate.
+
+## 5.1 Cohort / Sample Characteristics
+- Description of your data (counts, demographics, etc.)
+
+```{r}
+desc_table2
+```
+
+## 5.2 Model Performance
+- Summary of main results (metrics, comparisons among models)
+
+XGBoost achieved the highest ROC AUC of 0.643, indicating moderate predictive performance in identifying patients at risk for 30-day readmission after cardiac surgery, followed by logistic regression with a ROC AUC of 0.642, and random forest with a ROC AUC of 0.634. The ROC curves for all three models are shown in the figure below, with the AUC values indicated in the legend.
+
+```{r}
+auc_curve_plot
+```
+
+## 5.3 Additional Analyses
+- Feature importance (Shapley values), calibration, etc.
+
+
+# 6. Discussion
+Interpret the results and place them in context.
+
+## 6.1 Summary of Findings
+- What the results mean and how they relate to your aims
+
+## 6.2 Comparison with Previous Work
+- How your findings align with or differ from others
+
+## 6.3 Strengths and Limitations
+- What worked well; what constraints or biases exist
+
+## 6.4 Implications
+- Practical, theoretical, or clinical applications of your findings
+
+# 7. Conclusion
+Wrap up with clear takeaways and next steps.
+- Recap main conclusions
+- Significance and contributions
+- Suggestions for future research or improvements
+
+# 8. References
+- List all sources cited in your paper
+- Use consistent citation formatting (e.g., APA, MLA, or journal style)
+
+# 9. AI usage acknowledgement
+This project utilized AI tools (ChatGPT, Gemini, and Deepseek) in github copilot and web browser for code generation, debugging, writing assistance. The AI was used to brainstorm challenges and generate initial drafts. All outputs from the AI were reviewed and validated by the researcher to ensure accuracy and relevance to the project objectives.
